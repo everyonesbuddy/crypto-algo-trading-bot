@@ -1,0 +1,1 @@
+worker: python crypto_algo_trading_bot.py

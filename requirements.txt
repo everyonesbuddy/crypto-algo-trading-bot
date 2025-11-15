@@ -1,0 +1,9 @@
+ccxt
+pandas
+pandas_ta
+requests
+python-dotenv
+boto3
+botocore
+schedule
+time
