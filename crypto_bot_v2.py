@@ -28,7 +28,7 @@ AWS_S3_REGION = os.getenv("AWS_REGION")
 # ==========================================================
 # STRATEGY SETTINGS
 # ==========================================================
-LIVE_TRADING = False        # 🔴 SET TRUE AFTER TESTING
+LIVE_TRADING = True        # 🔴 SET TRUE AFTER TESTING
 TIMEFRAME = "4h"
 
 WATCHLIST = ["BTC/USD", "ETH/USD"]
