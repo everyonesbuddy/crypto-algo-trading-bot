@@ -1,1 +1,1 @@
-worker: python crypto_algo_trading_bot.py
+worker: python crypto_bot_v2.py
