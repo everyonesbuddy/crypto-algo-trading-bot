@@ -28,14 +28,15 @@ AWS_S3_REGION = os.getenv("AWS_REGION")
 # ==========================================================
 # STRATEGY SETTINGS
 # ==========================================================
-LIVE_TRADING = True        # 🔴 SET TRUE AFTER TESTING
+LIVE_TRADING = True
 TIMEFRAME = "4h"
 
 WATCHLIST = ["BTC/USD", "ETH/USD"]
 MAX_POSITIONS = 2
 
-RISK_PER_TRADE = 0.01       # 1% account risk
+RISK_PER_TRADE = 0.01
 MIN_TRADE_USD = 10
+MIN_POSITION_USD = 10     # 🔑 DUST FILTER (IMPORTANT)
 
 ATR_MULTIPLIER_SL = 2.5
 ATR_MULTIPLIER_TRAIL = 2.0
@@ -70,7 +71,7 @@ def send_discord(msg):
     if not DISCORD_WEBHOOK_URL:
         return
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=10)
     except Exception:
         pass
 
@@ -105,24 +106,37 @@ def fetch_data(symbol):
     return df
 
 # ==========================================================
-# PORTFOLIO HELPERS
+# PORTFOLIO HELPERS (DUST-SAFE)
 # ==========================================================
 def get_balances():
     bal = exchange.fetch_balance()["free"]
     usd = bal.get("USD", 0)
-    positions = {
-        k.replace("X","").replace("Z","") + "/USD": v
-        for k, v in bal.items()
-        if v > 0 and k not in ["USD","ZUSD"]
-    }
+
+    positions = {}
+
+    for asset, amount in bal.items():
+        if asset in ["USD", "ZUSD"] or amount <= 0:
+            continue
+
+        pair = asset.replace("X","").replace("Z","") + "/USD"
+
+        try:
+            price = exchange.fetch_ticker(pair)["last"]
+            value_usd = amount * price
+        except Exception:
+            continue
+
+        # 🔑 Ignore dust
+        if value_usd >= MIN_POSITION_USD:
+            positions[pair] = amount
+
     return usd, positions
 
 def portfolio_value(positions):
     total = 0.0
     for pair, amt in positions.items():
         try:
-            price = exchange.fetch_ticker(pair)["last"]
-            total += amt * price
+            total += amt * exchange.fetch_ticker(pair)["last"]
         except Exception:
             pass
     return total
@@ -147,18 +161,23 @@ def log_daily(date, start, current):
         w.writerow([date, f"{start:.2f}", f"{current:.2f}"])
 
 # ==========================================================
-# STRATEGY LOGIC
+# STRATEGY LOGIC (WITH DIAGNOSTICS)
 # ==========================================================
 def generate_signal(df):
     latest = df.iloc[-1]
+    reasons = []
 
     if latest["close"] < latest["EMA_200"]:
-        return "HOLD"
+        reasons.append("price < EMA200")
+    if latest["close"] < latest["EMA_50"]:
+        reasons.append("price < EMA50")
+    if latest["RSI"] <= 50:
+        reasons.append(f"RSI {latest['RSI']:.1f} ≤ 50")
 
-    if latest["RSI"] > 50 and latest["close"] > latest["EMA_50"]:
-        return "BUY"
+    if reasons:
+        return "HOLD", reasons
 
-    return "HOLD"
+    return "BUY", []
 
 # ==========================================================
 # POSITION SIZING
@@ -169,128 +188,72 @@ def calc_position_size(usd_balance, atr, price):
     if stop_distance <= 0:
         return 0
     qty = risk_usd / stop_distance
-    usd_alloc = qty * price
-    return max(usd_alloc, MIN_TRADE_USD)
+    return max(qty * price, MIN_TRADE_USD)
 
 # ==========================================================
 # PERFORMANCE METRICS
 # ==========================================================
-def compute_performance(trades_file=TRADES_CSV):
-    if not os.path.isfile(trades_file):
-        return {}
+def compute_performance():
+    if not os.path.isfile(TRADES_CSV):
+        return None
 
-    df = pd.read_csv(trades_file)
-    df = df[df['side'].isin(['BUY','SELL'])]
-    if df.empty:
-        return {}
+    df = pd.read_csv(TRADES_CSV)
+    df = df[df["side"].isin(["BUY","SELL"])]
 
-    # Pair trades into Buy->Sell
     results = []
-    grouped = df.groupby("symbol")
-    for symbol, g in grouped:
+    for _, g in df.groupby("symbol"):
         buys = g[g.side=="BUY"].reset_index()
         sells = g[g.side=="SELL"].reset_index()
-        min_len = min(len(buys), len(sells))
-        for i in range(min_len):
-            entry = buys.loc[i]
-            exit = sells.loc[i]
-            pnl = (exit.price - entry.price) / entry.price
+        for i in range(min(len(buys), len(sells))):
+            pnl = (sells.loc[i].price - buys.loc[i].price) / buys.loc[i].price
             results.append(pnl)
 
     if not results:
-        return {}
+        return None
 
-    results = pd.Series(results)
-    wins = results[results>0]
-    losses = results[results<=0]
-
-    win_rate = len(wins)/len(results)
-    avg_win = wins.mean() if len(wins)>0 else 0
-    avg_loss = losses.mean() if len(losses)>0 else 0
-    expectancy = win_rate*avg_win - (1-win_rate)*abs(avg_loss)
-
-    perf = {
-        "total_trades": len(results),
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate": win_rate,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "expectancy": expectancy
+    s = pd.Series(results)
+    return {
+        "trades": len(s),
+        "win_rate": (s > 0).mean(),
+        "expectancy": s.mean()
     }
-    return perf
 
 # ==========================================================
 # MAIN BOT
 # ==========================================================
+LAST_STATUS = {}
+
 def run_bot():
     print("\n⏱️ Running bot", datetime.datetime.now())
 
-    download_csv(
-        TRADES_CSV,
-        TRADES_CSV,
-        ["timestamp","symbol","side","price","qty","sl","trail_sl"]
-    )
-    download_csv(
-        DAILY_BALANCE_CSV,
-        DAILY_BALANCE_CSV,
-        ["date","starting_balance","current_balance"]
-    )
+    download_csv(TRADES_CSV, TRADES_CSV,
+        ["timestamp","symbol","side","price","qty","sl","trail_sl"])
+    download_csv(DAILY_BALANCE_CSV, DAILY_BALANCE_CSV,
+        ["date","starting_balance","current_balance"])
 
-    trades = pd.read_csv(TRADES_CSV)
     usd, positions = get_balances()
     total = usd + portfolio_value(positions)
-    today = datetime.date.today().isoformat()
-    log_daily(today, total, total)
+    log_daily(datetime.date.today().isoformat(), total, total)
 
-    # --------------------- SELL MANAGEMENT ---------------------
-    for pair, amt in positions.items():
-        df = fetch_data(pair)
-        price = df.iloc[-1]["close"]
-        atr = df.iloc[-1]["ATR"]
-
-        pair_trades = trades[(trades["symbol"]==pair) & (trades["side"]=="BUY")]
-        if pair_trades.empty:
-            continue
-
-        last_buy = pair_trades.iloc[-1]
-        sl = float(last_buy["sl"])
-        trail = float(last_buy["trail_sl"])
-        new_trail = max(trail, price - atr*ATR_MULTIPLIER_TRAIL)
-
-        if price <= sl or price <= new_trail:
-            if LIVE_TRADING:
-                exchange.create_market_sell_order(pair, amt)
-
-            log_trade({
-                "timestamp": datetime.datetime.now(),
-                "symbol": pair,
-                "side": "SELL",
-                "price": price,
-                "qty": amt,
-                "sl": "",
-                "trail_sl": ""
-            })
-            send_discord(f"🔻 SELL {pair} @ ${price:.2f}")
-        else:
-            trades.loc[last_buy.name,"trail_sl"] = new_trail
-            trades.to_csv(TRADES_CSV,index=False)
-
-    # --------------------- BUY LOGIC ---------------------
     for pair in WATCHLIST:
         if pair in positions:
             continue
 
         df = fetch_data(pair)
-        signal = generate_signal(df)
-        if signal != "BUY":
+        signal, reasons = generate_signal(df)
+
+        if signal == "HOLD":
+            reason_text = " | ".join(reasons)
+            if LAST_STATUS.get(pair) != reason_text:
+                send_discord(f"⏸️ {pair} — No trade\n• {reason_text}")
+                LAST_STATUS[pair] = reason_text
             continue
 
         atr = df.iloc[-1]["ATR"]
         price = df.iloc[-1]["close"]
         alloc = calc_position_size(usd, atr, price)
-        qty = alloc/price
-        sl = price - atr*ATR_MULTIPLIER_SL
+        qty = alloc / price
+        sl = price - atr * ATR_MULTIPLIER_SL
 
         if LIVE_TRADING:
             exchange.create_market_buy_order(pair, qty)
@@ -304,29 +267,33 @@ def run_bot():
             "sl": sl,
             "trail_sl": sl
         })
-        send_discord(f"🟢 BUY {pair} @ ${price:.2f}")
 
-    # --------------------- PERFORMANCE METRICS ---------------------
+        send_discord(f"🟢 BUY {pair} @ ${price:.2f}")
+        LAST_STATUS[pair] = "BOUGHT"
+
     perf = compute_performance()
     if perf:
-        msg = f"📊 Performance | Trades: {perf['total_trades']}, Wins: {perf['wins']}, Losses: {perf['losses']}, WinRate: {perf['win_rate']*100:.2f}%, Expectancy: {perf['expectancy']*100:.2f}%"
-        print(msg)
-        send_discord(msg)
+        send_discord(
+            f"📊 Performance\n"
+            f"Trades: {perf['trades']} | "
+            f"WinRate: {perf['win_rate']*100:.2f}% | "
+            f"Expectancy: {perf['expectancy']*100:.2f}%"
+        )
 
     upload_csv(TRADES_CSV, TRADES_CSV)
     upload_csv(DAILY_BALANCE_CSV, DAILY_BALANCE_CSV)
+
     print("✅ Cycle complete")
-
 # ==========================================================
-# RUN ONCE
-# ==========================================================
-# run_bot()
-
-# ==========================================================
-# SCHEDULER (ENABLE LATER)
+# SCHEDULER
 # ==========================================================
 schedule.every(4).hours.do(run_bot)
 print("🟢 Bot running (4H swing strategy)")
 while True:
     schedule.run_pending()
     time.sleep(30)
+
+# ==========================================================
+# RUN ONCE
+# ==========================================================
+# run_bot()
