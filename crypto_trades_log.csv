@@ -1,1 +1,1 @@
-timestamp,symbol,side,price,qty,sl,trail_sl
+timestamp,symbol,side,price,qty,sl,trail_sl,tp,regime,exit_reason
