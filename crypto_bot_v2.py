@@ -26,35 +26,40 @@ AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")
 AWS_S3_REGION = os.getenv("AWS_REGION")
 
 # ==========================================================
-# STRATEGY SETTINGS (REGIME-AWARE SWING)
+# STRATEGY SETTINGS (IMPROVED HOURLY MOMENTUM + MEAN REVERSION)
 # ==========================================================
 LIVE_TRADING = True
 
-# Micro execution timeframe (entries/exits)
-TIMEFRAME_MICRO = "4h"
+# Primary execution timeframe - 1H for better responsiveness
+TIMEFRAME = "1h"
+LOOKBACK_BARS = 500  # ~20 days of hourly data
 
-# Macro regime timeframe (trend context)
-TIMEFRAME_MACRO = "1d"
-MACRO_LOOKBACK_BARS = 240  # ~8 months of daily candles (enough for EMA200)
+# Regime detection timeframe
+REGIME_TIMEFRAME = "4h"
+REGIME_LOOKBACK = 200  # ~33 days of 4H data
 
-WATCHLIST = ["BTC/USD", "ETH/USD", "SOL/USD","XRP/USD","LTC/USD"]
+WATCHLIST = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "LTC/USD"]
 MAX_POSITIONS = 5
 
 # Risk & sizing
-RISK_PER_TRADE = 0.01
+RISK_PER_TRADE = 0.015  # Slightly more aggressive (1.5%)
 MIN_TRADE_USD = 10
-MIN_POSITION_USD = 10  # dust filter for existing holdings
+MIN_POSITION_USD = 10
 
-# Volatility stops
-ATR_MULTIPLIER_SL = 2.5
-ATR_MULTIPLIER_TRAIL = 2.0
+# Dynamic stops based on recent volatility
+ATR_MULTIPLIER_SL = 2.0  # Tighter initial stop
+ATR_MULTIPLIER_TRAIL = 1.5  # Tighter trail for faster exits
 
-# Generous take profit: TP = entry + TP_R_MULTIPLE * (entry - SL)
-TP_R_MULTIPLE = 3.0
+# Dynamic take-profit based on regime and volatility
+TP_BULL_MULTIPLIER = 2.5  # Bull markets: aim for 2.5R
+TP_BEAR_MULTIPLIER = 1.5  # Bear markets: take profits faster
+TP_RANGE_MULTIPLIER = 1.8  # Range-bound: moderate target
 
-# Bear-mode entry config (optional mean-reversion)
-ENABLE_BEAR_ENTRIES = True
-BEAR_RSI_OVERSOLD = 35  # example: allow bounce entries when RSI is very low
+# Mean reversion settings for bear/range markets
+ENABLE_MEAN_REVERSION = True
+MR_RSI_OVERSOLD = 30
+MR_RSI_OVERBOUGHT = 70
+MR_VOLUME_THRESHOLD = 1.2  # Require 20% above average volume
 
 TRADES_CSV = "crypto_trades_log.csv"
 DAILY_BALANCE_CSV = "daily_balance_log.csv"
@@ -98,10 +103,7 @@ def upload_csv(local: str, remote: str) -> None:
         pass
 
 def download_csv(remote: str, local: str, headers: list[str]) -> None:
-    """
-    Download CSV from S3 if it exists; otherwise create local CSV with headers.
-    This ensures every run has a file to read/write.
-    """
+    """Download CSV from S3 if it exists; otherwise create local CSV with headers."""
     try:
         s3.download_file(AWS_S3_BUCKET, remote, local)
     except Exception:
@@ -126,49 +128,84 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     df.set_index("ts", inplace=True)
     return df
 
-def add_micro_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Indicators used for entries/exits on the micro (4h) timeframe."""
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add technical indicators for 1H timeframe."""
+    # Trend indicators
+    df["EMA_20"] = ta.ema(df["close"], 20)
     df["EMA_50"] = ta.ema(df["close"], 50)
+    df["EMA_100"] = ta.ema(df["close"], 100)
+
+    # Momentum
     df["RSI"] = ta.rsi(df["close"], 14)
+
+    # Volatility
     df["ATR"] = ta.atr(df["high"], df["low"], df["close"], 14)
+
+    # Volume
+    df["Volume_MA"] = df["volume"].rolling(20).mean()
+    df["Volume_Ratio"] = df["volume"] / df["Volume_MA"]
+
+    # Support/Resistance zones (swing highs/lows)
+    df["Swing_High"] = df["high"].rolling(10, center=True).max()
+    df["Swing_Low"] = df["low"].rolling(10, center=True).min()
+
     df.dropna(inplace=True)
     return df
 
-def add_macro_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Indicators used for regime detection on the macro (daily) timeframe."""
-    df["EMA_200"] = ta.ema(df["close"], 200)
+def add_regime_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add indicators for regime detection on 4H timeframe."""
+    df["EMA_50"] = ta.ema(df["close"], 50)
+    df["EMA_100"] = ta.ema(df["close"], 100)
+    df["ADX"] = ta.adx(df["high"], df["low"], df["close"], 14)["ADX_14"]
     df.dropna(inplace=True)
     return df
 
 def determine_regime(symbol: str) -> tuple[str, dict]:
     """
-    Determine regime per symbol using daily EMA200.
+    Determine market regime using 4H timeframe.
 
     Returns:
-      regime: "BULL" or "BEAR"
-      info: dict with macro values for debugging/discord
+      regime: "BULL", "BEAR", or "RANGE"
+      info: dict with regime values for debugging
     """
     try:
-        df = fetch_ohlcv(symbol, TIMEFRAME_MACRO, MACRO_LOOKBACK_BARS)
-        df = add_macro_indicators(df)
+        df = fetch_ohlcv(symbol, REGIME_TIMEFRAME, REGIME_LOOKBACK)
+        df = add_regime_indicators(df)
         latest = df.iloc[-1]
+
         close = float(latest["close"])
-        ema200 = float(latest["EMA_200"])
-        regime = "BULL" if close > ema200 else "BEAR"
-        return regime, {"macro_close": close, "macro_ema200": ema200}
+        ema50 = float(latest["EMA_50"])
+        ema100 = float(latest["EMA_100"])
+        adx = float(latest["ADX"])
+
+        # Trend strength threshold
+        trending = adx > 25
+
+        if trending:
+            if close > ema50 and ema50 > ema100:
+                regime = "BULL"
+            elif close < ema50 and ema50 < ema100:
+                regime = "BEAR"
+            else:
+                regime = "RANGE"
+        else:
+            regime = "RANGE"
+
+        return regime, {
+            "close": close,
+            "ema50": ema50,
+            "ema100": ema100,
+            "adx": adx,
+            "trending": trending
+        }
     except Exception as e:
-        # If regime can't be determined, default conservative (BEAR) and explain why.
-        return "BEAR", {"error": str(e)}
+        return "RANGE", {"error": str(e)}
 
 # ==========================================================
-# PORTFOLIO HELPERS (DUST-SAFE)
+# PORTFOLIO HELPERS
 # ==========================================================
 def get_balances() -> tuple[float, dict]:
-    """
-    Return:
-      usd_balance: available USD
-      positions: dict of { "BTC/USD": qty, ... } excluding dust positions
-    """
+    """Return USD balance and positions dict."""
     bal = exchange.fetch_balance().get("free", {})
     usd = safe_float(bal.get("USD", 0.0))
 
@@ -180,15 +217,12 @@ def get_balances() -> tuple[float, dict]:
 
         pair = asset.replace("X", "").replace("Z", "") + "/USD"
 
-        # If ticker not available for a dust asset, skip.
         try:
             price = safe_float(exchange.fetch_ticker(pair).get("last", 0.0))
         except Exception:
             continue
 
         value_usd = amount * price
-
-        # Ignore dust to avoid blocking MAX_POSITIONS.
         if value_usd >= MIN_POSITION_USD:
             positions[pair] = amount
 
@@ -209,16 +243,13 @@ def portfolio_value(positions: dict) -> float:
 # LOGGING
 # ==========================================================
 def ensure_trade_log_headers() -> None:
-    """
-    Ensure the trade log schema supports our new strategy.
-    We store: sl, trail_sl, tp, and exit_reason for sells.
-    """
+    """Ensure trade log has proper headers."""
     if os.path.isfile(TRADES_CSV):
         return
     with open(TRADES_CSV, "w", newline="") as f:
         csv.writer(f).writerow([
             "timestamp", "symbol", "side", "price", "qty",
-            "sl", "trail_sl", "tp", "regime", "exit_reason"
+            "sl", "trail_sl", "tp", "regime", "signal_type", "exit_reason"
         ])
 
 def log_trade(row: dict) -> None:
@@ -240,56 +271,106 @@ def log_daily(date: str, start: float, current: float) -> None:
         w.writerow([date, f"{start:.2f}", f"{current:.2f}"])
 
 # ==========================================================
-# STRATEGY LOGIC
+# STRATEGY LOGIC - IMPROVED
 # ==========================================================
-def generate_entry_signal(micro_df: pd.DataFrame, regime: str) -> tuple[str, list[str]]:
+def generate_entry_signal(df: pd.DataFrame, regime: str) -> tuple[str, str, list[str]]:
     """
-    Regime-aware entry logic.
+    Generate entry signals based on regime and market conditions.
 
-    Bull regime: trend-following
-      - close > EMA50 AND RSI > 50
-
-    Bear regime: optional conservative mean-reversion
-      - RSI < BEAR_RSI_OVERSOLD AND close > EMA50 (reclaim)  [safer]
-      (You can loosen/tighten later.)
+    Returns:
+      signal: "BUY", "HOLD"
+      signal_type: "MOMENTUM", "MEAN_REVERSION", or ""
+      reasons: list of reason strings
     """
-    latest = micro_df.iloc[-1]
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+
     close = float(latest["close"])
+    ema20 = float(latest["EMA_20"])
     ema50 = float(latest["EMA_50"])
+    ema100 = float(latest["EMA_100"])
     rsi = float(latest["RSI"])
+    vol_ratio = float(latest["Volume_Ratio"])
 
     reasons = []
 
+    # ==========================================================
+    # BULL REGIME: Momentum Trading
+    # ==========================================================
     if regime == "BULL":
-        if close <= ema50:
-            reasons.append("close <= EMA50 (bull entry needs micro uptrend)")
-        if rsi <= 50:
-            reasons.append(f"RSI {rsi:.1f} <= 50 (bull entry needs momentum)")
-        if reasons:
-            return "HOLD", reasons
-        return "BUY", []
+        # Entry conditions:
+        # 1. Price above EMA20 (micro trend up)
+        # 2. EMA20 > EMA50 (trend alignment)
+        # 3. RSI between 40-65 (not overbought, has room)
+        # 4. Volume confirmation (above average)
 
-    # regime == BEAR
-    if not ENABLE_BEAR_ENTRIES:
-        return "HOLD", ["bear regime (bear entries disabled)"]
+        if close <= ema20:
+            reasons.append("price below EMA20")
+        if ema20 <= ema50:
+            reasons.append("EMA20 below EMA50")
+        if rsi >= 65:
+            reasons.append(f"RSI too high ({rsi:.1f})")
+        if rsi <= 40:
+            reasons.append(f"RSI too low ({rsi:.1f}, wait for momentum)")
+        if vol_ratio < 1.0:
+            reasons.append(f"low volume ({vol_ratio:.2f}x)")
 
-    # Conservative bear entry: oversold + reclaim micro trend
-    if rsi >= BEAR_RSI_OVERSOLD:
-        reasons.append(f"RSI {rsi:.1f} >= {BEAR_RSI_OVERSOLD} (need oversold)")
-    if close <= ema50:
-        reasons.append("close <= EMA50 (need reclaim for bounce)")
+        if not reasons:
+            return "BUY", "MOMENTUM", []
+        return "HOLD", "", reasons
 
-    if reasons:
-        return "HOLD", reasons
-    return "BUY", ["bear bounce entry"]
+    # ==========================================================
+    # BEAR REGIME: Mean Reversion (if enabled)
+    # ==========================================================
+    elif regime == "BEAR":
+        if not ENABLE_MEAN_REVERSION:
+            return "HOLD", "", ["bear market - no mean reversion enabled"]
 
-def calc_position_usd(usd_balance: float, atr: float, price: float) -> float:
+        # Entry conditions for bounce:
+        # 1. RSI oversold (< 30)
+        # 2. Price near or above EMA20 (starting to reclaim)
+        # 3. Volume spike (panic selling ending)
+
+        if rsi >= MR_RSI_OVERSOLD:
+            reasons.append(f"RSI not oversold ({rsi:.1f} >= {MR_RSI_OVERSOLD})")
+        if close < ema20 * 0.98:  # Allow 2% below EMA20
+            reasons.append("price too far below EMA20")
+        if vol_ratio < MR_VOLUME_THRESHOLD:
+            reasons.append(f"insufficient volume ({vol_ratio:.2f}x)")
+
+        if not reasons:
+            return "BUY", "MEAN_REVERSION", ["bear bounce setup"]
+        return "HOLD", "", reasons
+
+    # ==========================================================
+    # RANGE REGIME: Mean Reversion Both Ways
+    # ==========================================================
+    else:  # RANGE
+        if not ENABLE_MEAN_REVERSION:
+            return "HOLD", "", ["range market - no mean reversion enabled"]
+
+        # Entry conditions:
+        # 1. RSI oversold OR close near swing low
+        # 2. Not in downtrend (close > EMA50)
+        # 3. Volume confirmation
+
+        swing_low = float(latest["Swing_Low"])
+        near_support = close <= swing_low * 1.02  # Within 2% of swing low
+
+        if rsi >= MR_RSI_OVERSOLD and not near_support:
+            reasons.append(f"RSI {rsi:.1f} not oversold and not at support")
+        if close < ema50:
+            reasons.append("price below EMA50 (avoid downtrend)")
+        if vol_ratio < 1.0:
+            reasons.append(f"low volume ({vol_ratio:.2f}x)")
+
+        if not reasons:
+            return "BUY", "MEAN_REVERSION", ["range bounce setup"]
+        return "HOLD", "", reasons
+
+def calc_position_size(usd_balance: float, atr: float, price: float) -> float:
     """
-    Risk-based sizing:
-      risk_usd = account_usd * RISK_PER_TRADE
-      stop_distance = ATR * ATR_MULTIPLIER_SL
-      qty = risk_usd / stop_distance
-      usd_alloc = qty * price
+    Risk-based position sizing.
     """
     usd_balance = safe_float(usd_balance)
     atr = safe_float(atr)
@@ -305,8 +386,31 @@ def calc_position_usd(usd_balance: float, atr: float, price: float) -> float:
     usd_alloc = qty * price
     return max(usd_alloc, MIN_TRADE_USD)
 
+def calc_targets(price: float, atr: float, regime: str, signal_type: str) -> tuple[float, float]:
+    """
+    Calculate stop-loss and take-profit based on regime and signal type.
+
+    Returns:
+      sl: stop loss price
+      tp: take profit price
+    """
+    sl = price - atr * ATR_MULTIPLIER_SL
+
+    # Dynamic TP based on regime
+    if regime == "BULL" and signal_type == "MOMENTUM":
+        multiplier = TP_BULL_MULTIPLIER
+    elif regime == "BEAR" or signal_type == "MEAN_REVERSION":
+        multiplier = TP_BEAR_MULTIPLIER
+    else:  # RANGE
+        multiplier = TP_RANGE_MULTIPLIER
+
+    R = price - sl
+    tp = price + multiplier * R
+
+    return sl, tp
+
 def place_market_order(symbol: str, side: str, qty: float) -> None:
-    """Place a market order (or simulate if LIVE_TRADING is False)."""
+    """Place a market order."""
     if qty <= 0:
         return
     if not LIVE_TRADING:
@@ -318,23 +422,20 @@ def place_market_order(symbol: str, side: str, qty: float) -> None:
         exchange.create_market_sell_order(symbol, qty)
 
 # ==========================================================
-# TRADE MANAGEMENT (SL / TRAIL / TP)
+# TRADE MANAGEMENT
 # ==========================================================
 def load_trades_df() -> pd.DataFrame:
-    """Load trades CSV safely with expected columns."""
+    """Load trades CSV."""
     if not os.path.isfile(TRADES_CSV):
         return pd.DataFrame(columns=[
             "timestamp", "symbol", "side", "price", "qty",
-            "sl", "trail_sl", "tp", "regime", "exit_reason"
+            "sl", "trail_sl", "tp", "regime", "signal_type", "exit_reason"
         ])
     df = pd.read_csv(TRADES_CSV)
     return df
 
 def get_last_open_trade(trades_df: pd.DataFrame, symbol: str) -> pd.Series | None:
-    """
-    Find the most recent BUY that has not been "closed" by a SELL.
-    We approximate this by counting buys vs sells per symbol.
-    """
+    """Find the most recent open BUY for a symbol."""
     g = trades_df[trades_df["symbol"] == symbol].copy()
     if g.empty:
         return None
@@ -343,17 +444,15 @@ def get_last_open_trade(trades_df: pd.DataFrame, symbol: str) -> pd.Series | Non
     if g.empty:
         return None
 
-    # If #buys == #sells, no open trade in our log.
     buys = g[g["side"] == "BUY"]
     sells = g[g["side"] == "SELL"]
     if len(buys) <= len(sells):
         return None
 
-    # Open trade = last BUY row
     return buys.iloc[-1]
 
 def update_trailing_stop(trades_df: pd.DataFrame, buy_row_index: int, new_trail: float) -> None:
-    """Persist updated trailing stop into trades CSV by editing the specific BUY row."""
+    """Update trailing stop in trades CSV."""
     trades_df.loc[buy_row_index, "trail_sl"] = new_trail
     trades_df.to_csv(TRADES_CSV, index=False)
 
@@ -361,10 +460,7 @@ def update_trailing_stop(trades_df: pd.DataFrame, buy_row_index: int, new_trail:
 # PERFORMANCE METRICS
 # ==========================================================
 def compute_performance() -> dict | None:
-    """
-    Compute win-rate + expectancy from completed Buy->Sell pairs.
-    Expectancy here = mean return per trade (simple, percent).
-    """
+    """Compute win-rate and expectancy from completed trades."""
     if not os.path.isfile(TRADES_CSV):
         return None
 
@@ -377,12 +473,10 @@ def compute_performance() -> dict | None:
         return None
 
     results = []
-
     for symbol, g in df.groupby("symbol"):
         buys = g[g.side == "BUY"].reset_index(drop=True)
         sells = g[g.side == "SELL"].reset_index(drop=True)
 
-        # Pair in order (assumes you do not pyramid multiple entries per symbol).
         n = min(len(buys), len(sells))
         for i in range(n):
             entry = float(buys.loc[i, "price"])
@@ -396,7 +490,16 @@ def compute_performance() -> dict | None:
     s = pd.Series(results)
     win_rate = float((s > 0).mean())
     expectancy = float(s.mean())
-    return {"trades": int(len(s)), "win_rate": win_rate, "expectancy": expectancy}
+    avg_win = float(s[s > 0].mean()) if (s > 0).any() else 0
+    avg_loss = float(s[s < 0].mean()) if (s < 0).any() else 0
+
+    return {
+        "trades": int(len(s)),
+        "win_rate": win_rate,
+        "expectancy": expectancy,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss
+    }
 
 # ==========================================================
 # DISCORD STATUS DEDUPING
@@ -404,7 +507,7 @@ def compute_performance() -> dict | None:
 LAST_STATUS = {}
 
 def send_no_trade_once(symbol: str, reason_text: str) -> None:
-    """Avoid spamming Discord with the same hold reason repeatedly."""
+    """Avoid spamming Discord."""
     if LAST_STATUS.get(symbol) != reason_text:
         send_discord(f"⏸️ {symbol} — No trade\n• {reason_text}")
         LAST_STATUS[symbol] = reason_text
@@ -414,12 +517,12 @@ def send_no_trade_once(symbol: str, reason_text: str) -> None:
 # ==========================================================
 def run_bot():
     now = datetime.datetime.now()
-    print("\n⏱️ Running bot", now)
+    print(f"\n⏱️ Running bot at {now}")
 
-    # Ensure local files exist and have the right headers
+    # Setup files
     download_csv(
         TRADES_CSV, TRADES_CSV,
-        ["timestamp", "symbol", "side", "price", "qty", "sl", "trail_sl", "tp", "regime", "exit_reason"]
+        ["timestamp", "symbol", "side", "price", "qty", "sl", "trail_sl", "tp", "regime", "signal_type", "exit_reason"]
     )
     download_csv(
         DAILY_BALANCE_CSV, DAILY_BALANCE_CSV,
@@ -431,67 +534,67 @@ def run_bot():
     trades_df = load_trades_df()
     usd, positions = get_balances()
 
-    # Balance snapshot (simple running log; we keep it minimal here)
+    # Balance snapshot
     total = usd + portfolio_value(positions)
     log_daily(datetime.date.today().isoformat(), total, total)
 
     # ======================================================
-    # 1) MANAGE EXISTING POSITIONS FIRST (SELL LOGIC)
+    # 1) MANAGE EXISTING POSITIONS (EXIT LOGIC)
     # ======================================================
     for symbol, qty_held in positions.items():
-        # Only manage symbols we are watching (optional).
-        # If you want to manage ANY held symbol, remove this if-check.
         if symbol not in WATCHLIST:
             continue
 
-        # Pull micro data for management
         try:
-            micro = fetch_ohlcv(symbol, TIMEFRAME_MICRO, 300)
-            micro = add_micro_indicators(micro)
-            latest = micro.iloc[-1]
+            df = fetch_ohlcv(symbol, TIMEFRAME, LOOKBACK_BARS)
+            df = add_indicators(df)
+            latest = df.iloc[-1]
             price = float(latest["close"])
             atr = float(latest["ATR"])
+            rsi = float(latest["RSI"])
         except Exception as e:
-            send_discord(f"⚠️ {symbol} — data fetch failed for management: {e}")
+            send_discord(f"⚠️ {symbol} — data fetch failed: {e}")
             continue
 
         last_buy = get_last_open_trade(trades_df, symbol)
         if last_buy is None:
-            # We have a position on exchange but no matching BUY in our log.
-            # Don't trade blindly; just notify.
-            send_discord(f"⚠️ {symbol} — position exists but no open BUY in log; skipping management.")
+            send_discord(f"⚠️ {symbol} — position exists but no open BUY in log")
             continue
 
         sl = safe_float(last_buy.get("sl", 0.0))
         trail_sl = safe_float(last_buy.get("trail_sl", sl))
         tp = safe_float(last_buy.get("tp", 0.0))
+        signal_type = last_buy.get("signal_type", "")
 
-        # --- Update trailing stop (always)
+        # Update trailing stop
         new_trail = max(trail_sl, price - atr * ATR_MULTIPLIER_TRAIL)
 
-        # Persist trailing stop update into the BUY row
         buy_row_index = int(last_buy.name) if hasattr(last_buy, "name") else None
         if buy_row_index is not None and new_trail != trail_sl:
             try:
                 update_trailing_stop(trades_df, buy_row_index, new_trail)
-                # reload to keep indices aligned
                 trades_df = load_trades_df()
                 trail_sl = new_trail
             except Exception:
-                # If update fails, we still continue (best-effort)
                 trail_sl = new_trail
 
-        # --- Exit priority: SL -> TRAIL -> TP
+        # Exit logic with additional mean-reversion exit
         exit_reason = None
+
+        # Hard stop loss
         if sl > 0 and price <= sl:
             exit_reason = "SL"
+        # Trailing stop
         elif trail_sl > 0 and price <= trail_sl:
             exit_reason = "TRAIL"
+        # Take profit
         elif tp > 0 and price >= tp:
             exit_reason = "TP"
+        # Mean-reversion specific: exit if RSI gets overbought
+        elif signal_type == "MEAN_REVERSION" and rsi >= MR_RSI_OVERBOUGHT:
+            exit_reason = "MR_OVERBOUGHT"
 
         if exit_reason:
-            # Place SELL
             place_market_order(symbol, "sell", float(qty_held))
 
             log_trade({
@@ -504,21 +607,21 @@ def run_bot():
                 "trail_sl": "",
                 "tp": "",
                 "regime": last_buy.get("regime", ""),
+                "signal_type": "",
                 "exit_reason": exit_reason
             })
 
             send_discord(f"🔻 SELL {symbol} @ ${price:.2f} ({exit_reason})")
             LAST_STATUS[symbol] = f"SOLD({exit_reason})"
 
-    # Refresh balances after possible sells
+    # Refresh after sells
     usd, positions = get_balances()
 
     # ======================================================
     # 2) FIND NEW ENTRIES (BUY LOGIC)
     # ======================================================
-    # Enforce MAX_POSITIONS (dust-safe): count only meaningful positions
     if len(positions) >= MAX_POSITIONS:
-        send_discord(f"ℹ️ Max positions reached ({len(positions)}/{MAX_POSITIONS}). No new entries this run.")
+        send_discord(f"ℹ️ Max positions reached ({len(positions)}/{MAX_POSITIONS})")
     else:
         for symbol in WATCHLIST:
             if symbol in positions:
@@ -526,48 +629,39 @@ def run_bot():
             if len(positions) >= MAX_POSITIONS:
                 break
 
-            # Determine regime using macro timeframe
-            regime, macro_info = determine_regime(symbol)
+            # Determine regime
+            regime, regime_info = determine_regime(symbol)
 
-            # Fetch micro data (4h) and evaluate entry
+            # Fetch data and evaluate entry
             try:
-                micro = fetch_ohlcv(symbol, TIMEFRAME_MICRO, 300)
-                micro = add_micro_indicators(micro)
+                df = fetch_ohlcv(symbol, TIMEFRAME, LOOKBACK_BARS)
+                df = add_indicators(df)
             except Exception as e:
-                send_discord(f"⚠️ {symbol} — micro data fetch failed: {e}")
+                send_discord(f"⚠️ {symbol} — data fetch failed: {e}")
                 continue
 
-            signal, reasons = generate_entry_signal(micro, regime)
+            signal, signal_type, reasons = generate_entry_signal(df, regime)
 
             if signal != "BUY":
-                # Add macro info to help you understand "why no trades"
-                macro_note = ""
-                if "macro_close" in macro_info and "macro_ema200" in macro_info:
-                    macro_note = f" | macro close {macro_info['macro_close']:.2f} vs EMA200 {macro_info['macro_ema200']:.2f} ({regime})"
-                elif "error" in macro_info:
-                    macro_note = f" | macro regime error: {macro_info['error']}"
-
-                reason_text = " | ".join(reasons) + macro_note
+                regime_str = f"{regime} (ADX: {regime_info.get('adx', 0):.1f})"
+                reason_text = " | ".join(reasons) + f" | {regime_str}"
                 send_no_trade_once(symbol, reason_text)
                 continue
 
-            latest = micro.iloc[-1]
+            latest = df.iloc[-1]
             price = float(latest["close"])
             atr = float(latest["ATR"])
 
-            # Position sizing based on risk
-            usd_alloc = calc_position_usd(usd, atr, price)
+            # Position sizing
+            usd_alloc = calc_position_size(usd, atr, price)
             qty = usd_alloc / price if price > 0 else 0.0
 
-            # Compute SL / TP based on ATR risk model
-            sl = price - atr * ATR_MULTIPLIER_SL
-            R = price - sl  # initial risk per unit
-            tp = price + TP_R_MULTIPLE * R
+            # Calculate targets
+            sl, tp = calc_targets(price, atr, regime, signal_type)
 
             # Place BUY
             place_market_order(symbol, "buy", qty)
 
-            # Log BUY with full context
             log_trade({
                 "timestamp": datetime.datetime.now(),
                 "symbol": symbol,
@@ -575,56 +669,63 @@ def run_bot():
                 "price": price,
                 "qty": qty,
                 "sl": sl,
-                "trail_sl": sl,   # trail starts at SL (can start higher later)
+                "trail_sl": sl,
                 "tp": tp,
                 "regime": regime,
+                "signal_type": signal_type,
                 "exit_reason": ""
             })
 
             send_discord(
-                f"🟢 BUY {symbol} @ ${price:.2f} ({regime})\n"
-                f"SL {sl:.2f} | TP {tp:.2f} | ATR {atr:.2f}"
+                f"🟢 BUY {symbol} @ ${price:.2f}\n"
+                f"Type: {signal_type} | Regime: {regime}\n"
+                f"SL: ${sl:.2f} | TP: ${tp:.2f} | Risk: {RISK_PER_TRADE*100:.1f}%"
             )
-            LAST_STATUS[symbol] = "BOUGHT"
+            LAST_STATUS[symbol] = f"BOUGHT({signal_type})"
 
-            # Refresh balances after buy
+            # Refresh balances
             usd, positions = get_balances()
 
     # ======================================================
-    # 3) PERFORMANCE METRICS (from completed trades)
+    # 3) PERFORMANCE METRICS
     # ======================================================
     perf = compute_performance()
-    if perf:
+    if perf and perf['trades'] >= 5:  # Only show after meaningful sample size
         send_discord(
-            f"📊 Performance\n"
-            f"Trades: {perf['trades']} | "
-            f"WinRate: {perf['win_rate']*100:.2f}% | "
+            f"📊 Performance ({perf['trades']} trades)\n"
+            f"Win Rate: {perf['win_rate']*100:.1f}% | "
+            f"Avg Win: {perf['avg_win']*100:.1f}% | "
+            f"Avg Loss: {perf['avg_loss']*100:.1f}% | "
             f"Expectancy: {perf['expectancy']*100:.2f}%"
         )
 
     # ======================================================
-    # 4) SYNC TO S3 + RUN SUMMARY
+    # 4) SYNC TO S3
     # ======================================================
     upload_csv(TRADES_CSV, TRADES_CSV)
     upload_csv(DAILY_BALANCE_CSV, DAILY_BALANCE_CSV)
 
     send_discord(
-        f"🔁 Run complete ({now.strftime('%Y-%m-%d %H:%M:%S')})\n"
+        f"🔁 Run complete ({now.strftime('%H:%M:%S')})\n"
         f"USD: ${usd:.2f} | Positions: {len(positions)}/{MAX_POSITIONS}"
     )
 
     print("✅ Cycle complete")
 
 # ==========================================================
-# SCHEDULER
+# SCHEDULER - RUN EVERY HOUR
 # ==========================================================
-schedule.every(4).hours.do(run_bot)
-print("🟢 Bot running (Regime-aware 4H swing strategy)")
+schedule.every(1).hours.do(run_bot)
+
+print("🟢 Bot running (Improved 1H Momentum + Mean Reversion)")
+print(f"Strategy: {TIMEFRAME} timeframe | Regime detection: {REGIME_TIMEFRAME}")
+print(f"Risk per trade: {RISK_PER_TRADE*100}% | Max positions: {MAX_POSITIONS}")
+
 while True:
     schedule.run_pending()
-    time.sleep(30)
+    time.sleep(60)
 
 # ==========================================================
-# RUN ONCE (optional)
+# RUN ONCE (for testing)
 # ==========================================================
 # run_bot()
