@@ -26,7 +26,7 @@ AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")
 AWS_S3_REGION = os.getenv("AWS_REGION")
 
 # ==========================================================
-# STRATEGY SETTINGS (IMPROVED HOURLY MOMENTUM + MEAN REVERSION)
+# STRATEGY SETTINGS (FIXED FOR SLOW BLEED MARKETS)
 # ==========================================================
 LIVE_TRADING = True
 
@@ -41,25 +41,26 @@ REGIME_LOOKBACK = 200  # ~33 days of 4H data
 WATCHLIST = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "LTC/USD"]
 MAX_POSITIONS = 5
 
-# Risk & sizing
-RISK_PER_TRADE = 0.015  # Slightly more aggressive (1.5%)
+# Risk & sizing - REDUCED for bear market
+RISK_PER_TRADE = 0.01  # Back to 1% in bear market (was 1.5%)
 MIN_TRADE_USD = 10
 MIN_POSITION_USD = 10
 
 # Dynamic stops based on recent volatility
-ATR_MULTIPLIER_SL = 2.0  # Tighter initial stop
-ATR_MULTIPLIER_TRAIL = 1.5  # Tighter trail for faster exits
+ATR_MULTIPLIER_SL = 1.5  # Tighter stop in bear (was 2.0)
+ATR_MULTIPLIER_TRAIL = 1.2  # Very tight trail (was 1.5)
 
-# Dynamic take-profit based on regime and volatility
-TP_BULL_MULTIPLIER = 2.5  # Bull markets: aim for 2.5R
-TP_BEAR_MULTIPLIER = 1.5  # Bear markets: take profits faster
-TP_RANGE_MULTIPLIER = 1.8  # Range-bound: moderate target
+# Dynamic take-profit - MUCH MORE CONSERVATIVE
+TP_BULL_MULTIPLIER = 2.0  # Reduced from 2.5
+TP_BEAR_MULTIPLIER = 1.2  # Reduced from 1.5 - take fast profits
+TP_RANGE_MULTIPLIER = 1.5  # Reduced from 1.8
 
-# Mean reversion settings for bear/range markets
+# Mean reversion settings - LOOSENED FOR SLOW BLEEDS
 ENABLE_MEAN_REVERSION = True
-MR_RSI_OVERSOLD = 30
-MR_RSI_OVERBOUGHT = 70
-MR_VOLUME_THRESHOLD = 1.2  # Require 20% above average volume
+MR_RSI_OVERSOLD = 40  # Loosened from 30 - catch earlier
+MR_RSI_OVERBOUGHT = 62  # Tightened from 70 - exit faster
+MR_VOLUME_THRESHOLD = 0.7  # Way looser - don't require volume in slow bleeds
+MR_ALLOW_BELOW_EMA = True  # NEW: allow entries even if below EMA20
 
 TRADES_CSV = "crypto_trades_log.csv"
 DAILY_BALANCE_CSV = "daily_balance_log.csv"
@@ -138,6 +139,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # Momentum
     df["RSI"] = ta.rsi(df["close"], 14)
 
+    # Stochastic for better oversold detection
+    stoch = ta.stoch(df["high"], df["low"], df["close"], 14, 3, 3)
+    df["Stoch_K"] = stoch["STOCHk_14_3_3"]
+    df["Stoch_D"] = stoch["STOCHd_14_3_3"]
+
     # Volatility
     df["ATR"] = ta.atr(df["high"], df["low"], df["close"], 14)
 
@@ -145,7 +151,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["Volume_MA"] = df["volume"].rolling(20).mean()
     df["Volume_Ratio"] = df["volume"] / df["Volume_MA"]
 
-    # Support/Resistance zones (swing highs/lows)
+    # Support/Resistance zones
     df["Swing_High"] = df["high"].rolling(10, center=True).max()
     df["Swing_Low"] = df["low"].rolling(10, center=True).min()
 
@@ -271,7 +277,7 @@ def log_daily(date: str, start: float, current: float) -> None:
         w.writerow([date, f"{start:.2f}", f"{current:.2f}"])
 
 # ==========================================================
-# STRATEGY LOGIC - IMPROVED
+# STRATEGY LOGIC - FIXED FOR SLOW BLEEDS
 # ==========================================================
 def generate_entry_signal(df: pd.DataFrame, regime: str) -> tuple[str, str, list[str]]:
     """
@@ -290,6 +296,7 @@ def generate_entry_signal(df: pd.DataFrame, regime: str) -> tuple[str, str, list
     ema50 = float(latest["EMA_50"])
     ema100 = float(latest["EMA_100"])
     rsi = float(latest["RSI"])
+    stoch_k = float(latest["Stoch_K"])
     vol_ratio = float(latest["Volume_Ratio"])
 
     reasons = []
@@ -298,12 +305,6 @@ def generate_entry_signal(df: pd.DataFrame, regime: str) -> tuple[str, str, list
     # BULL REGIME: Momentum Trading
     # ==========================================================
     if regime == "BULL":
-        # Entry conditions:
-        # 1. Price above EMA20 (micro trend up)
-        # 2. EMA20 > EMA50 (trend alignment)
-        # 3. RSI between 40-65 (not overbought, has room)
-        # 4. Volume confirmation (above average)
-
         if close <= ema20:
             reasons.append("price below EMA20")
         if ema20 <= ema50:
@@ -311,7 +312,7 @@ def generate_entry_signal(df: pd.DataFrame, regime: str) -> tuple[str, str, list
         if rsi >= 65:
             reasons.append(f"RSI too high ({rsi:.1f})")
         if rsi <= 40:
-            reasons.append(f"RSI too low ({rsi:.1f}, wait for momentum)")
+            reasons.append(f"RSI too low ({rsi:.1f})")
         if vol_ratio < 1.0:
             reasons.append(f"low volume ({vol_ratio:.2f}x)")
 
@@ -320,58 +321,64 @@ def generate_entry_signal(df: pd.DataFrame, regime: str) -> tuple[str, str, list
         return "HOLD", "", reasons
 
     # ==========================================================
-    # BEAR REGIME: Mean Reversion (if enabled)
+    # BEAR REGIME: Mean Reversion - LOOSENED SIGNIFICANTLY
     # ==========================================================
     elif regime == "BEAR":
         if not ENABLE_MEAN_REVERSION:
             return "HOLD", "", ["bear market - no mean reversion enabled"]
 
-        # Entry conditions for bounce:
-        # 1. RSI oversold (< 30)
-        # 2. Price near or above EMA20 (starting to reclaim)
-        # 3. Volume spike (panic selling ending)
+        # NEW LOGIC for slow-bleed bears:
+        # Either: RSI < 40 OR Stochastic oversold (< 20)
+        # Plus: Not in free-fall (some sign of stabilization)
 
-        if rsi >= MR_RSI_OVERSOLD:
-            reasons.append(f"RSI not oversold ({rsi:.1f} >= {MR_RSI_OVERSOLD})")
-        if close < ema20 * 0.98:  # Allow 2% below EMA20
-            reasons.append("price too far below EMA20")
+        is_oversold = rsi < MR_RSI_OVERSOLD or stoch_k < 20
+
+        # Check if price is stabilizing (not free-falling)
+        # Allow entry even if below EMA20, as long as RSI/Stoch show oversold
+        stabilizing = True  # Default to allowing
+
+        if not MR_ALLOW_BELOW_EMA:
+            # If strict mode, require price near EMA20
+            if close < ema20 * 0.95:  # More than 5% below
+                stabilizing = False
+                reasons.append("price too far below EMA20")
+
+        # Volume check - very loose now
         if vol_ratio < MR_VOLUME_THRESHOLD:
             reasons.append(f"insufficient volume ({vol_ratio:.2f}x)")
 
-        if not reasons:
-            return "BUY", "MEAN_REVERSION", ["bear bounce setup"]
+        # Main oversold check
+        if not is_oversold:
+            reasons.append(f"not oversold (RSI {rsi:.1f}, Stoch {stoch_k:.1f})")
+
+        if not reasons and is_oversold:
+            return "BUY", "MEAN_REVERSION", [f"bear bounce (RSI {rsi:.1f}, Stoch {stoch_k:.1f})"]
         return "HOLD", "", reasons
 
     # ==========================================================
-    # RANGE REGIME: Mean Reversion Both Ways
+    # RANGE REGIME: Mean Reversion
     # ==========================================================
     else:  # RANGE
         if not ENABLE_MEAN_REVERSION:
             return "HOLD", "", ["range market - no mean reversion enabled"]
 
-        # Entry conditions:
-        # 1. RSI oversold OR close near swing low
-        # 2. Not in downtrend (close > EMA50)
-        # 3. Volume confirmation
-
         swing_low = float(latest["Swing_Low"])
-        near_support = close <= swing_low * 1.02  # Within 2% of swing low
+        near_support = close <= swing_low * 1.02
+        is_oversold = rsi < MR_RSI_OVERSOLD or stoch_k < 20
 
-        if rsi >= MR_RSI_OVERSOLD and not near_support:
-            reasons.append(f"RSI {rsi:.1f} not oversold and not at support")
+        if not is_oversold and not near_support:
+            reasons.append(f"not oversold (RSI {rsi:.1f}) and not at support")
         if close < ema50:
-            reasons.append("price below EMA50 (avoid downtrend)")
-        if vol_ratio < 1.0:
+            reasons.append("price below EMA50")
+        if vol_ratio < 0.8:  # Very loose
             reasons.append(f"low volume ({vol_ratio:.2f}x)")
 
         if not reasons:
-            return "BUY", "MEAN_REVERSION", ["range bounce setup"]
+            return "BUY", "MEAN_REVERSION", ["range bounce"]
         return "HOLD", "", reasons
 
 def calc_position_size(usd_balance: float, atr: float, price: float) -> float:
-    """
-    Risk-based position sizing.
-    """
+    """Risk-based position sizing."""
     usd_balance = safe_float(usd_balance)
     atr = safe_float(atr)
     price = safe_float(price)
@@ -388,7 +395,7 @@ def calc_position_size(usd_balance: float, atr: float, price: float) -> float:
 
 def calc_targets(price: float, atr: float, regime: str, signal_type: str) -> tuple[float, float]:
     """
-    Calculate stop-loss and take-profit based on regime and signal type.
+    Calculate stop-loss and take-profit.
 
     Returns:
       sl: stop loss price
@@ -578,7 +585,7 @@ def run_bot():
             except Exception:
                 trail_sl = new_trail
 
-        # Exit logic with additional mean-reversion exit
+        # Exit logic
         exit_reason = None
 
         # Hard stop loss
@@ -590,7 +597,7 @@ def run_bot():
         # Take profit
         elif tp > 0 and price >= tp:
             exit_reason = "TP"
-        # Mean-reversion specific: exit if RSI gets overbought
+        # Mean-reversion: exit at RSI 62 now
         elif signal_type == "MEAN_REVERSION" and rsi >= MR_RSI_OVERBOUGHT:
             exit_reason = "MR_OVERBOUGHT"
 
@@ -644,7 +651,13 @@ def run_bot():
 
             if signal != "BUY":
                 regime_str = f"{regime} (ADX: {regime_info.get('adx', 0):.1f})"
-                reason_text = " | ".join(reasons) + f" | {regime_str}"
+                latest = df.iloc[-1]
+                rsi = float(latest["RSI"])
+                stoch = float(latest["Stoch_K"])
+                vol = float(latest["Volume_Ratio"])
+
+                # Enhanced logging to see WHY we're not trading
+                reason_text = " | ".join(reasons) + f" | {regime_str} | RSI:{rsi:.1f} Stoch:{stoch:.1f} Vol:{vol:.2f}x"
                 send_no_trade_once(symbol, reason_text)
                 continue
 
@@ -690,7 +703,7 @@ def run_bot():
     # 3) PERFORMANCE METRICS
     # ======================================================
     perf = compute_performance()
-    if perf and perf['trades'] >= 5:  # Only show after meaningful sample size
+    if perf and perf['trades'] >= 5:
         send_discord(
             f"📊 Performance ({perf['trades']} trades)\n"
             f"Win Rate: {perf['win_rate']*100:.1f}% | "
@@ -717,9 +730,10 @@ def run_bot():
 # ==========================================================
 schedule.every(1).hours.do(run_bot)
 
-print("🟢 Bot running (Improved 1H Momentum + Mean Reversion)")
+print("🟢 Bot running (Fixed for Slow-Bleed Bear Markets)")
 print(f"Strategy: {TIMEFRAME} timeframe | Regime detection: {REGIME_TIMEFRAME}")
 print(f"Risk per trade: {RISK_PER_TRADE*100}% | Max positions: {MAX_POSITIONS}")
+print(f"Mean-reversion: RSI < {MR_RSI_OVERSOLD} | Volume > {MR_VOLUME_THRESHOLD}x")
 
 while True:
     schedule.run_pending()
