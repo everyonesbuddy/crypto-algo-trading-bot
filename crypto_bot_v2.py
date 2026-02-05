@@ -42,18 +42,18 @@ WATCHLIST = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "LTC/USD"]
 MAX_POSITIONS = 5
 
 # Risk & sizing - REDUCED for bear market
-RISK_PER_TRADE = 0.01  # Back to 1% in bear market (was 1.5%)
+RISK_PER_TRADE = 0.01  # Back to 1% in bear market
 MIN_TRADE_USD = 10
 MIN_POSITION_USD = 10
 
 # Dynamic stops based on recent volatility
-ATR_MULTIPLIER_SL = 1.5  # Tighter stop in bear (was 2.0)
-ATR_MULTIPLIER_TRAIL = 1.2  # Very tight trail (was 1.5)
+ATR_MULTIPLIER_SL = 1.5  # Tighter stop in bear
+ATR_MULTIPLIER_TRAIL = 1.2  # Very tight trail
 
 # Dynamic take-profit - MUCH MORE CONSERVATIVE
-TP_BULL_MULTIPLIER = 2.0  # Reduced from 2.5
-TP_BEAR_MULTIPLIER = 1.2  # Reduced from 1.5 - take fast profits
-TP_RANGE_MULTIPLIER = 1.5  # Reduced from 1.8
+TP_BULL_MULTIPLIER = 2.0
+TP_BEAR_MULTIPLIER = 1.2  # Take fast profits
+TP_RANGE_MULTIPLIER = 1.5
 
 # Mean reversion settings - LOOSENED FOR SLOW BLEEDS
 ENABLE_MEAN_REVERSION = True
@@ -93,21 +93,25 @@ def send_discord(msg: str) -> None:
         return
     try:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=10)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Discord send failed: {e}")
 
 def upload_csv(local: str, remote: str) -> None:
-    """Upload a CSV to S3 (best-effort)."""
+    """Upload a CSV to S3 with error handling."""
     try:
         s3.upload_file(local, AWS_S3_BUCKET, remote)
-    except Exception:
-        pass
+        print(f"✅ Uploaded {local} to S3")
+    except Exception as e:
+        print(f"⚠️ S3 upload failed for {local}: {e}")
+        send_discord(f"⚠️ S3 upload failed for {local}: {e}")
 
 def download_csv(remote: str, local: str, headers: list[str]) -> None:
     """Download CSV from S3 if it exists; otherwise create local CSV with headers."""
     try:
         s3.download_file(AWS_S3_BUCKET, remote, local)
-    except Exception:
+        print(f"✅ Downloaded {remote} from S3")
+    except Exception as e:
+        print(f"⚠️ S3 download failed for {remote}, creating new file: {e}")
         with open(local, "w", newline="") as f:
             csv.writer(f).writerow(headers)
 
@@ -208,31 +212,101 @@ def determine_regime(symbol: str) -> tuple[str, dict]:
         return "RANGE", {"error": str(e)}
 
 # ==========================================================
-# PORTFOLIO HELPERS
+# PORTFOLIO HELPERS - FIXED WITH DEBUGGING
 # ==========================================================
 def get_balances() -> tuple[float, dict]:
-    """Return USD balance and positions dict."""
-    bal = exchange.fetch_balance().get("free", {})
-    usd = safe_float(bal.get("USD", 0.0))
+    """
+    Return USD balance and positions dict.
 
-    positions = {}
-    for asset, amount in bal.items():
-        amount = safe_float(amount)
-        if asset in ["USD", "ZUSD"] or amount <= 0:
-            continue
+    CRITICAL FIX: Properly handle Kraken asset names
+    """
+    try:
+        bal = exchange.fetch_balance().get("free", {})
 
-        pair = asset.replace("X", "").replace("Z", "") + "/USD"
+        # DEBUG: Log what Kraken actually returns
+        print(f"\n🔍 DEBUG: Raw Kraken balance keys: {list(bal.keys())}")
 
-        try:
-            price = safe_float(exchange.fetch_ticker(pair).get("last", 0.0))
-        except Exception:
-            continue
+        usd = safe_float(bal.get("USD", 0.0))
+        if usd == 0:
+            usd = safe_float(bal.get("ZUSD", 0.0))
 
-        value_usd = amount * price
-        if value_usd >= MIN_POSITION_USD:
-            positions[pair] = amount
+        positions = {}
 
-    return usd, positions
+        # CRITICAL: Kraken asset name mapping
+        # Explicit mapping for known assets
+        KRAKEN_ASSET_MAP = {
+            "XXBT": "BTC",
+            "XBT": "BTC",
+            "XETH": "ETH",
+            "ZUSD": "USD",
+            "XXRP": "XRP",
+        }
+
+        for asset, amount in bal.items():
+            amount = safe_float(amount)
+
+            # Skip USD and zero balances
+            if asset in ["USD", "ZUSD"] or amount <= 0:
+                continue
+
+            # Map asset name using explicit mapping first
+            if asset in KRAKEN_ASSET_MAP:
+                clean_asset = KRAKEN_ASSET_MAP[asset]
+            else:
+                # For unmapped assets, use smart logic:
+                if asset.startswith(("X", "Z")) and len(asset) > 3:
+                    # Try stripping first character
+                    test_asset = asset[1:]
+                    # Only use stripped version if it looks like a real ticker (3-4 chars)
+                    if 3 <= len(test_asset) <= 4:
+                        clean_asset = test_asset
+                    else:
+                        clean_asset = asset
+                else:
+                    # Asset is already in correct format (SOL, XRP, ADA, etc.)
+                    clean_asset = asset
+
+            # Create pair symbol
+            pair = f"{clean_asset}/USD"
+
+            # DEBUG: Log the mapping with more detail
+            print(f"🔍 DEBUG: '{asset}' → '{clean_asset}' → '{pair}' | Amount: {amount:.8f}")
+
+            # Verify pair exists in watchlist before checking price
+            if pair not in WATCHLIST:
+                print(f"⚠️ WARNING: {pair} not in watchlist, skipping")
+                continue
+
+            try:
+                ticker = exchange.fetch_ticker(pair)
+                price = safe_float(ticker.get("last", 0.0))
+
+                if price <= 0:
+                    print(f"⚠️ WARNING: Invalid price for {pair}: {price}")
+                    continue
+
+            except Exception as e:
+                print(f"⚠️ WARNING: Failed to fetch ticker for {pair}: {e}")
+                continue
+
+            value_usd = amount * price
+
+            # Filter out dust positions
+            if value_usd >= MIN_POSITION_USD:
+                positions[pair] = amount
+                print(f"✅ Position: {pair} = {amount:.8f} (${value_usd:.2f})")
+            else:
+                print(f"⏭️ Skipping dust: {pair} = {amount:.8f} (${value_usd:.2f})")
+
+        print(f"\n💰 Final USD: ${usd:.2f}")
+        print(f"📊 Final Positions: {positions}")
+
+        return usd, positions
+
+    except Exception as e:
+        print(f"🚨 CRITICAL: get_balances() failed: {e}")
+        send_discord(f"🚨 CRITICAL: get_balances() failed: {e}")
+        return 0.0, {}
 
 def portfolio_value(positions: dict) -> float:
     """Estimate USD value of current positions."""
@@ -246,7 +320,7 @@ def portfolio_value(positions: dict) -> float:
     return total
 
 # ==========================================================
-# LOGGING
+# LOGGING - FIXED WITH VERIFICATION
 # ==========================================================
 def ensure_trade_log_headers() -> None:
     """Ensure trade log has proper headers."""
@@ -259,13 +333,48 @@ def ensure_trade_log_headers() -> None:
         ])
 
 def log_trade(row: dict) -> None:
-    """Append a trade row to CSV."""
-    exists = os.path.isfile(TRADES_CSV)
-    with open(TRADES_CSV, "a", newline="") as f:
-        w = csv.writer(f)
-        if not exists:
-            w.writerow(row.keys())
-        w.writerow(row.values())
+    """
+    Append a trade row to CSV with verification and immediate S3 backup.
+
+    CRITICAL FIX: Verify write succeeded and upload immediately
+    """
+    try:
+        # Write to local file
+        exists = os.path.isfile(TRADES_CSV)
+        with open(TRADES_CSV, "a", newline="") as f:
+            w = csv.writer(f)
+            if not exists:
+                w.writerow(row.keys())
+            w.writerow(row.values())
+
+        print(f"✅ Logged trade: {row['side']} {row['symbol']} @ ${row['price']}")
+
+        # IMMEDIATELY upload to S3 after EVERY trade
+        upload_csv(TRADES_CSV, TRADES_CSV)
+
+        # Verify the write succeeded by reading back
+        verify_df = pd.read_csv(TRADES_CSV)
+        if verify_df.empty:
+            raise Exception("CSV appears empty after write!")
+
+        # Verify the last row matches what we just wrote
+        last_row = verify_df.iloc[-1]
+        if last_row['symbol'] != row['symbol'] or last_row['side'] != row['side']:
+            raise Exception(f"CSV verification failed! Expected {row['symbol']} {row['side']}, got {last_row['symbol']} {last_row['side']}")
+
+        print(f"✅ Trade log verified")
+
+    except Exception as e:
+        error_msg = f"🚨 CRITICAL: log_trade() failed: {e}"
+        print(error_msg)
+        send_discord(error_msg)
+
+        # Try to log to a backup file
+        try:
+            with open("trade_log_backup.txt", "a") as f:
+                f.write(f"{datetime.datetime.now()}: {row}\n")
+        except:
+            pass
 
 def log_daily(date: str, start: float, current: float) -> None:
     """Append daily balance snapshot."""
@@ -416,17 +525,35 @@ def calc_targets(price: float, atr: float, regime: str, signal_type: str) -> tup
 
     return sl, tp
 
-def place_market_order(symbol: str, side: str, qty: float) -> None:
-    """Place a market order."""
+def place_market_order(symbol: str, side: str, qty: float) -> bool:
+    """
+    Place a market order with error handling.
+
+    Returns: True if successful, False if failed
+    """
     if qty <= 0:
-        return
-    if not LIVE_TRADING:
-        print(f"[TEST] {side.upper()} {symbol} qty={qty:.8f}")
-        return
-    if side.lower() == "buy":
-        exchange.create_market_buy_order(symbol, qty)
-    else:
-        exchange.create_market_sell_order(symbol, qty)
+        print(f"⚠️ Invalid quantity: {qty}")
+        return False
+
+    try:
+        if not LIVE_TRADING:
+            print(f"[TEST] {side.upper()} {symbol} qty={qty:.8f}")
+            return True
+
+        if side.lower() == "buy":
+            order = exchange.create_market_buy_order(symbol, qty)
+        else:
+            order = exchange.create_market_sell_order(symbol, qty)
+
+        print(f"✅ Order executed: {side.upper()} {symbol} qty={qty:.8f}")
+        print(f"🔍 Order details: {order}")
+        return True
+
+    except Exception as e:
+        error_msg = f"🚨 CRITICAL: Order failed! {side.upper()} {symbol} qty={qty:.8f}: {e}"
+        print(error_msg)
+        send_discord(error_msg)
+        return False
 
 # ==========================================================
 # TRADE MANAGEMENT
@@ -453,6 +580,10 @@ def get_last_open_trade(trades_df: pd.DataFrame, symbol: str) -> pd.Series | Non
 
     buys = g[g["side"] == "BUY"]
     sells = g[g["side"] == "SELL"]
+
+    # DEBUG
+    print(f"🔍 DEBUG: {symbol} - Buys: {len(buys)}, Sells: {len(sells)}")
+
     if len(buys) <= len(sells):
         return None
 
@@ -462,6 +593,7 @@ def update_trailing_stop(trades_df: pd.DataFrame, buy_row_index: int, new_trail:
     """Update trailing stop in trades CSV."""
     trades_df.loc[buy_row_index, "trail_sl"] = new_trail
     trades_df.to_csv(TRADES_CSV, index=False)
+    upload_csv(TRADES_CSV, TRADES_CSV)  # Immediate backup
 
 # ==========================================================
 # PERFORMANCE METRICS
@@ -520,11 +652,13 @@ def send_no_trade_once(symbol: str, reason_text: str) -> None:
         LAST_STATUS[symbol] = reason_text
 
 # ==========================================================
-# MAIN BOT
+# MAIN BOT - WITH COMPREHENSIVE DEBUGGING
 # ==========================================================
 def run_bot():
     now = datetime.datetime.now()
-    print(f"\n⏱️ Running bot at {now}")
+    print(f"\n{'='*60}")
+    print(f"⏱️ Running bot at {now}")
+    print(f"{'='*60}")
 
     # Setup files
     download_csv(
@@ -539,7 +673,14 @@ def run_bot():
 
     # Load state
     trades_df = load_trades_df()
+    print(f"\n📊 Loaded {len(trades_df)} historical trades")
+
     usd, positions = get_balances()
+    print(f"\n💰 Account Status:")
+    print(f"   USD: ${usd:.2f}")
+    print(f"   Positions: {len(positions)}/{MAX_POSITIONS}")
+    for pair, qty in positions.items():
+        print(f"   - {pair}: {qty:.8f}")
 
     # Balance snapshot
     total = usd + portfolio_value(positions)
@@ -548,8 +689,15 @@ def run_bot():
     # ======================================================
     # 1) MANAGE EXISTING POSITIONS (EXIT LOGIC)
     # ======================================================
+    print(f"\n{'='*60}")
+    print(f"STEP 1: Managing {len(positions)} existing positions")
+    print(f"{'='*60}")
+
     for symbol, qty_held in positions.items():
+        print(f"\n📍 Checking {symbol} (holding {qty_held:.8f})")
+
         if symbol not in WATCHLIST:
+            print(f"⏭️ Skipping {symbol} (not in watchlist)")
             continue
 
         try:
@@ -559,6 +707,9 @@ def run_bot():
             price = float(latest["close"])
             atr = float(latest["ATR"])
             rsi = float(latest["RSI"])
+
+            print(f"   Current price: ${price:.2f}, RSI: {rsi:.1f}, ATR: ${atr:.2f}")
+
         except Exception as e:
             send_discord(f"⚠️ {symbol} — data fetch failed: {e}")
             continue
@@ -566,15 +717,23 @@ def run_bot():
         last_buy = get_last_open_trade(trades_df, symbol)
         if last_buy is None:
             send_discord(f"⚠️ {symbol} — position exists but no open BUY in log")
+            print(f"⚠️ WARNING: No BUY record found in log!")
             continue
 
         sl = safe_float(last_buy.get("sl", 0.0))
         trail_sl = safe_float(last_buy.get("trail_sl", sl))
         tp = safe_float(last_buy.get("tp", 0.0))
         signal_type = last_buy.get("signal_type", "")
+        entry_price = safe_float(last_buy.get("price", 0.0))
+
+        print(f"   Entry: ${entry_price:.2f}, SL: ${sl:.2f}, Trail: ${trail_sl:.2f}, TP: ${tp:.2f}")
+        print(f"   P/L: {((price - entry_price) / entry_price * 100):.2f}%")
 
         # Update trailing stop
         new_trail = max(trail_sl, price - atr * ATR_MULTIPLIER_TRAIL)
+
+        if new_trail != trail_sl:
+            print(f"   📈 Updating trailing stop: ${trail_sl:.2f} → ${new_trail:.2f}")
 
         buy_row_index = int(last_buy.name) if hasattr(last_buy, "name") else None
         if buy_row_index is not None and new_trail != trail_sl:
@@ -582,7 +741,8 @@ def run_bot():
                 update_trailing_stop(trades_df, buy_row_index, new_trail)
                 trades_df = load_trades_df()
                 trail_sl = new_trail
-            except Exception:
+            except Exception as e:
+                print(f"⚠️ Failed to update trailing stop: {e}")
                 trail_sl = new_trail
 
         # Exit logic
@@ -591,53 +751,81 @@ def run_bot():
         # Hard stop loss
         if sl > 0 and price <= sl:
             exit_reason = "SL"
+            print(f"   🚨 Stop-loss hit! Price ${price:.2f} <= SL ${sl:.2f}")
         # Trailing stop
         elif trail_sl > 0 and price <= trail_sl:
             exit_reason = "TRAIL"
+            print(f"   📉 Trailing stop hit! Price ${price:.2f} <= Trail ${trail_sl:.2f}")
         # Take profit
         elif tp > 0 and price >= tp:
             exit_reason = "TP"
+            print(f"   🎯 Take-profit hit! Price ${price:.2f} >= TP ${tp:.2f}")
         # Mean-reversion: exit at RSI 62 now
         elif signal_type == "MEAN_REVERSION" and rsi >= MR_RSI_OVERBOUGHT:
             exit_reason = "MR_OVERBOUGHT"
+            print(f"   🔄 Mean-reversion overbought! RSI {rsi:.1f} >= {MR_RSI_OVERBOUGHT}")
 
         if exit_reason:
-            place_market_order(symbol, "sell", float(qty_held))
+            print(f"   🔻 SELLING {symbol} @ ${price:.2f} ({exit_reason})")
 
-            log_trade({
-                "timestamp": datetime.datetime.now(),
-                "symbol": symbol,
-                "side": "SELL",
-                "price": price,
-                "qty": float(qty_held),
-                "sl": "",
-                "trail_sl": "",
-                "tp": "",
-                "regime": last_buy.get("regime", ""),
-                "signal_type": "",
-                "exit_reason": exit_reason
-            })
+            # Place SELL order
+            success = place_market_order(symbol, "sell", float(qty_held))
 
-            send_discord(f"🔻 SELL {symbol} @ ${price:.2f} ({exit_reason})")
-            LAST_STATUS[symbol] = f"SOLD({exit_reason})"
+            if success:
+                # Log the trade
+                log_trade({
+                    "timestamp": datetime.datetime.now(),
+                    "symbol": symbol,
+                    "side": "SELL",
+                    "price": price,
+                    "qty": float(qty_held),
+                    "sl": "",
+                    "trail_sl": "",
+                    "tp": "",
+                    "regime": last_buy.get("regime", ""),
+                    "signal_type": "",
+                    "exit_reason": exit_reason
+                })
+
+                send_discord(f"🔻 SELL {symbol} @ ${price:.2f} ({exit_reason})")
+                LAST_STATUS[symbol] = f"SOLD({exit_reason})"
+            else:
+                send_discord(f"🚨 FAILED to sell {symbol}!")
+        else:
+            print(f"   ✅ Holding {symbol} (no exit condition met)")
 
     # Refresh after sells
+    print(f"\n🔄 Refreshing balances after exits...")
     usd, positions = get_balances()
 
     # ======================================================
     # 2) FIND NEW ENTRIES (BUY LOGIC)
     # ======================================================
+    print(f"\n{'='*60}")
+    print(f"STEP 2: Looking for new entries")
+    print(f"{'='*60}")
+    print(f"USD available: ${usd:.2f}")
+    print(f"Current positions: {len(positions)}/{MAX_POSITIONS}")
+
     if len(positions) >= MAX_POSITIONS:
         send_discord(f"ℹ️ Max positions reached ({len(positions)}/{MAX_POSITIONS})")
+        print(f"⏭️ Max positions reached, skipping new entries")
     else:
         for symbol in WATCHLIST:
+            print(f"\n🔍 Evaluating {symbol}")
+
+            # CRITICAL CHECK: Skip if we already own this symbol
             if symbol in positions:
+                print(f"   ⏭️ Already holding {symbol}, skipping")
                 continue
+
             if len(positions) >= MAX_POSITIONS:
+                print(f"   ⏭️ Max positions reached, stopping search")
                 break
 
             # Determine regime
             regime, regime_info = determine_regime(symbol)
+            print(f"   Regime: {regime} (ADX: {regime_info.get('adx', 0):.1f})")
 
             # Fetch data and evaluate entry
             try:
@@ -645,6 +833,7 @@ def run_bot():
                 df = add_indicators(df)
             except Exception as e:
                 send_discord(f"⚠️ {symbol} — data fetch failed: {e}")
+                print(f"   ⚠️ Data fetch failed: {e}")
                 continue
 
             signal, signal_type, reasons = generate_entry_signal(df, regime)
@@ -656,6 +845,9 @@ def run_bot():
                 stoch = float(latest["Stoch_K"])
                 vol = float(latest["Volume_Ratio"])
 
+                print(f"   ⏸️ No entry: {', '.join(reasons)}")
+                print(f"   📊 RSI:{rsi:.1f} Stoch:{stoch:.1f} Vol:{vol:.2f}x")
+
                 # Enhanced logging to see WHY we're not trading
                 reason_text = " | ".join(reasons) + f" | {regime_str} | RSI:{rsi:.1f} Stoch:{stoch:.1f} Vol:{vol:.2f}x"
                 send_no_trade_once(symbol, reason_text)
@@ -664,46 +856,75 @@ def run_bot():
             latest = df.iloc[-1]
             price = float(latest["close"])
             atr = float(latest["ATR"])
+            rsi = float(latest["RSI"])
+            stoch = float(latest["Stoch_K"])
+
+            print(f"   🟢 BUY SIGNAL! {signal_type}")
+            print(f"   📊 Price: ${price:.2f}, RSI: {rsi:.1f}, Stoch: {stoch:.1f}, ATR: ${atr:.2f}")
 
             # Position sizing
             usd_alloc = calc_position_size(usd, atr, price)
             qty = usd_alloc / price if price > 0 else 0.0
 
+            print(f"   💵 Position size: ${usd_alloc:.2f} ({qty:.8f} units)")
+
             # Calculate targets
             sl, tp = calc_targets(price, atr, regime, signal_type)
 
-            # Place BUY
-            place_market_order(symbol, "buy", qty)
+            print(f"   🎯 SL: ${sl:.2f}, TP: ${tp:.2f}")
+            print(f"   📉 Risk: ${(price - sl) * qty:.2f} ({RISK_PER_TRADE*100}%)")
+            print(f"   📈 Reward: ${(tp - price) * qty:.2f}")
 
-            log_trade({
-                "timestamp": datetime.datetime.now(),
-                "symbol": symbol,
-                "side": "BUY",
-                "price": price,
-                "qty": qty,
-                "sl": sl,
-                "trail_sl": sl,
-                "tp": tp,
-                "regime": regime,
-                "signal_type": signal_type,
-                "exit_reason": ""
-            })
+            # Place BUY order
+            print(f"   🔵 Placing BUY order...")
+            success = place_market_order(symbol, "buy", qty)
 
-            send_discord(
-                f"🟢 BUY {symbol} @ ${price:.2f}\n"
-                f"Type: {signal_type} | Regime: {regime}\n"
-                f"SL: ${sl:.2f} | TP: ${tp:.2f} | Risk: {RISK_PER_TRADE*100:.1f}%"
-            )
-            LAST_STATUS[symbol] = f"BOUGHT({signal_type})"
+            if success:
+                # Log the trade
+                log_trade({
+                    "timestamp": datetime.datetime.now(),
+                    "symbol": symbol,
+                    "side": "BUY",
+                    "price": price,
+                    "qty": qty,
+                    "sl": sl,
+                    "trail_sl": sl,
+                    "tp": tp,
+                    "regime": regime,
+                    "signal_type": signal_type,
+                    "exit_reason": ""
+                })
 
-            # Refresh balances
-            usd, positions = get_balances()
+                send_discord(
+                    f"🟢 BUY {symbol} @ ${price:.2f}\n"
+                    f"Type: {signal_type} | Regime: {regime}\n"
+                    f"SL: ${sl:.2f} | TP: ${tp:.2f} | Risk: {RISK_PER_TRADE*100:.1f}%"
+                )
+                LAST_STATUS[symbol] = f"BOUGHT({signal_type})"
+
+                print(f"   ✅ BUY order successful!")
+
+                # Refresh balances
+                usd, positions = get_balances()
+            else:
+                send_discord(f"🚨 FAILED to buy {symbol}!")
+                print(f"   🚨 BUY order FAILED!")
 
     # ======================================================
     # 3) PERFORMANCE METRICS
     # ======================================================
+    print(f"\n{'='*60}")
+    print(f"STEP 3: Performance metrics")
+    print(f"{'='*60}")
+
     perf = compute_performance()
     if perf and perf['trades'] >= 5:
+        print(f"📊 Trades: {perf['trades']}")
+        print(f"   Win Rate: {perf['win_rate']*100:.1f}%")
+        print(f"   Avg Win: {perf['avg_win']*100:.1f}%")
+        print(f"   Avg Loss: {perf['avg_loss']*100:.1f}%")
+        print(f"   Expectancy: {perf['expectancy']*100:.2f}%")
+
         send_discord(
             f"📊 Performance ({perf['trades']} trades)\n"
             f"Win Rate: {perf['win_rate']*100:.1f}% | "
@@ -715,6 +936,10 @@ def run_bot():
     # ======================================================
     # 4) SYNC TO S3
     # ======================================================
+    print(f"\n{'='*60}")
+    print(f"STEP 4: Syncing to S3")
+    print(f"{'='*60}")
+
     upload_csv(TRADES_CSV, TRADES_CSV)
     upload_csv(DAILY_BALANCE_CSV, DAILY_BALANCE_CSV)
 
@@ -723,17 +948,20 @@ def run_bot():
         f"USD: ${usd:.2f} | Positions: {len(positions)}/{MAX_POSITIONS}"
     )
 
-    print("✅ Cycle complete")
+    print(f"\n{'='*60}")
+    print(f"✅ Cycle complete at {datetime.datetime.now()}")
+    print(f"{'='*60}\n")
 
 # ==========================================================
 # SCHEDULER - RUN EVERY HOUR
 # ==========================================================
 schedule.every(1).hours.do(run_bot)
 
-print("🟢 Bot running (Fixed for Slow-Bleed Bear Markets)")
+print("🟢 Bot starting (DEBUGGED VERSION)")
 print(f"Strategy: {TIMEFRAME} timeframe | Regime detection: {REGIME_TIMEFRAME}")
 print(f"Risk per trade: {RISK_PER_TRADE*100}% | Max positions: {MAX_POSITIONS}")
 print(f"Mean-reversion: RSI < {MR_RSI_OVERSOLD} | Volume > {MR_VOLUME_THRESHOLD}x")
+print("\nDEBUG MODE ENABLED - All operations will be logged verbosely\n")
 
 while True:
     schedule.run_pending()
